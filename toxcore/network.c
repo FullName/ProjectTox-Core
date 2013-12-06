@@ -36,6 +36,16 @@
 #include "network.h"
 #include "util.h"
 
+#ifdef HAVE_LIBNATPMP
+#include <natpmp.h>
+
+#define PORT_FORWARD_DURATION 7200
+
+static void *init_port_forwarding(uint16_t port);
+static int8_t check_port_forwarding(void **_natpmp, uint16_t port);
+
+#endif /* HAVE_LIBNATPMP */
+
 #ifndef IPV6_V6ONLY
 #define IPV6_V6ONLY 27
 #endif
@@ -275,9 +285,45 @@ void networking_registerhandler(Networking_Core *net, uint8_t byte, packet_handl
     net->packethandlers[byte].object = object;
 }
 
+#ifdef HAVE_LIBNATPMP
+static void natpmp_do(Networking_Core *net)
+{
+    if ((net->port_forward_start != 0) && (net->port_forward_start != unix_time())) {
+        /* request was sent, poll for success/failure */
+        net->port_forward_start = unix_time();
+
+        if (!net->natpmp) /* something went wrong... somewhere */
+            net->port_forward_start = 0;
+        else {
+            /* poll status */
+            int8_t res = check_port_forwarding(&net->natpmp, net->port);
+
+            if (res > 0) { /* mapping has been accepted */
+                net->port_forward_start = 0;
+                net->port_forward_until = unix_time() + PORT_FORWARD_DURATION;
+            } else if (res < 0) /* error we can't recover from */
+                net->port_forward_start = 0;
+        }
+    } else if (!net->natpmp && net->port_forward_until
+               && is_timeout(net->port_forward_until, PORT_FORWARD_DURATION * 3 / 4)) {
+        /* we're closing in on the end of the mapping's lifetime: (try to) refresh mapping */
+        net->natpmp = init_port_forwarding(net->port);
+
+        if (net->natpmp) /* request sent, start polling again */
+            net->port_forward_start = unix_time();
+        else /* very unexpected failure: try again in 1/8 PFD (15m) */
+            net->port_forward_until += PORT_FORWARD_DURATION / 8;
+    }
+}
+#endif /* HAVE_LIBNATPMP */
+
 void networking_poll(Networking_Core *net)
 {
     unix_time_update();
+
+#ifdef HAVE_LIBNATPMP
+    natpmp_do(net);
+#endif /* HAVE_LIBNATPMP */
 
     IP_Port ip_port;
     uint8_t data[MAX_UDP_PACKET_SIZE];
@@ -433,6 +479,96 @@ static void at_shutdown(void)
 #endif
 }
 */
+
+
+/* request UDP port forwarding for PORT_FORWARD_DURATION from outside to inside
+ *  return a pointer if setup was successful and request pushed,
+ *  return NULL on error. */
+void *init_port_forwarding(uint16_t port)
+{
+#ifdef HAVE_LIBNATPMP
+    natpmp_t *natpmp = calloc(1, sizeof(*natpmp));
+
+    if (!natpmp)
+        return NULL;
+
+    if (initnatpmp(natpmp, 0, 0) != 0) {
+        free(natpmp);
+        return NULL;
+    }
+
+    if (sendnewportmappingrequest(natpmp, NATPMP_PROTOCOL_UDP, port, port, PORT_FORWARD_DURATION) != 12) {
+        closenatpmp(natpmp);
+        free(natpmp);
+        return NULL;
+    }
+
+    return natpmp;
+#else /* !HAVE_LIBNATPMP */
+    return NULL;
+#endif /* !HAVE_LIBNATPMP */
+}
+
+/* tries to figure out if the request was successfully delivered
+ * and accepted by a gateway device
+ *
+ *  returns  1 if request was successful
+ *  returns  0 if status of request hasn't been decided yet
+ *  returns -1 on error
+ */
+int8_t check_port_forwarding(void **_natpmp, uint16_t port)
+{
+#ifdef HAVE_LIBNATPMP
+
+    if (!_natpmp || !*_natpmp)
+        return -1;
+
+    natpmp_t *natpmp = *_natpmp;
+    natpmpresp_t response;
+    int res = readnatpmpresponseorretry(natpmp, &response);
+
+    if (res == NATPMP_TRYAGAIN)
+        return 0; /* keep trying */
+    else if (res == 0) {
+        closenatpmp(natpmp);
+        free(natpmp);
+        *_natpmp = NULL;
+
+#ifdef LOGGING
+        loglog("Port forwarding: Completed successfully.\n");
+#endif /* LOGGING */
+
+        return 1;
+    } else if (res == NATPMP_ERR_NOPENDINGREQ) {
+        /* request failed: retry from the beginning */
+        closenatpmp(natpmp);
+        free(natpmp);
+        *_natpmp = init_port_forwarding(port);
+
+#ifdef LOGGING
+        loglog("Port forwarding: Request to setup didn't make it. Trying again...\n");
+#endif /* LOGGING */
+
+        return 0;
+    } else {
+        /* "unrecoverable" error */
+        closenatpmp(natpmp);
+        free(natpmp);
+        *_natpmp = NULL;
+
+#ifdef LOGGING
+        sprintf(logbuffer, "Port forwarding: Request to setup failed terminally. Last result %i.\n", res);
+        loglog(logbuffer);
+#endif /* LOGGING */
+
+        return -1;
+    }
+
+#else /* !HAVE_LIBNATPMP */
+    return 0;
+#endif /* !HAVE_LIBNATPMP */
+}
+
 
 /* Initialize networking.
  * Bind to ip and port.
@@ -630,6 +766,18 @@ Networking_Core *new_networking(IP ip, uint16_t port)
             sprintf(logbuffer, "Bound successfully to %s:%u.\n", ip_ntoa(&ip), ntohs(temp->port));
             loglog(logbuffer);
 #endif
+
+#ifdef HAVE_LIBNATPMP
+            temp->natpmp = init_port_forwarding(temp->port);
+
+            if (temp->natpmp) {
+                temp->port_forward_start = unix_time();
+#ifdef LOGGING
+                loglog("Port forwarding: Setting up.\n");
+#endif /* LOGGING */
+            }
+
+#endif /* HAVE_LIBNATPMP */
 
             /* errno isn't reset on success, only set on failure, the failed
              * binds with parallel clients yield a -EPERM to the outside if

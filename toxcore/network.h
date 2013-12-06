@@ -238,6 +238,9 @@ typedef struct {
     uint16_t port;
     sock_t sock;
     uint64_t send_fail_eagain;
+
+    void *natpmp;
+    uint64_t port_forward_start, port_forward_until;
 } Networking_Core;
 
 /*  return current time in milleseconds since the epoch. */

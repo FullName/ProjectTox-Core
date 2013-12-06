@@ -45,6 +45,7 @@ NCURSES_FOUND="no"
 LIBCONFIG_FOUND="no"
 LIBCHECK_FOUND="no"
 WANT_NACL="no"
+WANT_NATPMP="no"
 
 AC_ARG_ENABLE([nacl],
     [AC_HELP_STRING([--enable-nacl], [use nacl instead of libsodium (default: disabled)]) ],
@@ -114,6 +115,17 @@ AC_ARG_ENABLE([testing],
     ]
 )
 
+AC_ARG_ENABLE([natpmp],
+    [AC_HELP_STRING([--enable-natpmp], [use NAT-PMP to ease NAT traversal (default: disabled)]) ],
+    [
+        if test "x$enableval" = "xno"; then
+            WANT_NATPMP="no"
+        elif test "x$enableval" = "xyes"; then
+            WANT_NATPMP="yes"
+        fi
+    ]
+)
+
 DEPSEARCH=
 LIBSODIUM_SEARCH_HEADERS=
 LIBSODIUM_SEARCH_LIBS=
@@ -138,7 +150,7 @@ fi
 
 AC_ARG_WITH(nacl-headers,
         AC_HELP_STRING([--with-nacl-headers=DIR],
-                       [search for nacl<F2> header files in DIR]),
+                       [search for nacl header files in DIR]),
         [
             NACL_SEARCH_HEADERS="$withval"
             AC_MSG_NOTICE([will search for nacl header files in $withval])
@@ -264,6 +276,7 @@ else
     AC_SUBST(LIBSODIUM_LDFLAGS)
 fi
 
+
 # Checks for header files.
 AC_CHECK_HEADERS([arpa/inet.h fcntl.h netdb.h netinet/in.h stdint.h stdlib.h string.h sys/socket.h sys/time.h unistd.h])
 
@@ -321,6 +334,27 @@ else
     CFLAGS="$CFLAGS_SAVE"
     CPPFLAGS="$CPPFLAGS_SAVE"
     AC_SUBST(LIBSODIUM_CFLAGS)
+fi
+
+if test "x$WANT_NATPMP" = "xyes"; then
+    AC_CHECK_HEADER(natpmp.h,
+        [],
+        [
+            AC_MSG_WARN([header file for library libnatpmp was not found on your system, disabling NAT-PMP support])
+            WANT_NATPMP=no
+        ]
+    )
+    AC_CHECK_LIB(natpmp, initnatpmp,
+        [],
+        [
+            AC_MSG_WARN([library libnatpmp was not found on your system, disabling NAT-PMP support])
+            WANT_NATPMP=no
+        ]
+    )
+
+    if test "x$WANT_NATPMP" = "xyes"; then
+        LIBS="$LIBS -lnatpmp"
+    fi
 fi
 
 # Checks for typedefs, structures, and compiler characteristics.
@@ -587,6 +621,7 @@ AM_CONDITIONAL(BUILD_TESTS, test "x$BUILD_TESTS" = "xyes")
 AM_CONDITIONAL(BUILD_NTOX, test "x$BUILD_NTOX" = "xyes")
 AM_CONDITIONAL(BUILD_AV, test "x$BUILD_AV" = "xyes")
 AM_CONDITIONAL(BUILD_TESTING, test "x$BUILD_TESTING" = "xyes")
+AM_CONDITIONAL(WANT_NATPMP, test "x$WANT_NATPMP" = "xyes")
 AM_CONDITIONAL(WIN32, test "x$WIN32" = "xyes")
 
 AC_CONFIG_FILES([Makefile
