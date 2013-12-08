@@ -46,6 +46,7 @@ LIBCONFIG_FOUND="no"
 LIBCHECK_FOUND="no"
 WANT_NACL="no"
 WANT_NATPMP="no"
+WANT_NATUPNP="no"
 
 AC_ARG_ENABLE([nacl],
     [AC_HELP_STRING([--enable-nacl], [use nacl instead of libsodium (default: disabled)]) ],
@@ -115,6 +116,7 @@ AC_ARG_ENABLE([testing],
     ]
 )
 
+
 AC_ARG_ENABLE([natpmp],
     [AC_HELP_STRING([--enable-natpmp], [use NAT-PMP to ease NAT traversal (default: disabled)]) ],
     [
@@ -125,6 +127,17 @@ AC_ARG_ENABLE([natpmp],
         fi
     ]
 )
+AC_ARG_ENABLE([natupnp],
+    [AC_HELP_STRING([--enable-natupnp], [use NAT-UPnP to ease NAT traversal (default: disabled)]) ],
+    [
+        if test "x$enableval" = "xno"; then
+            WANT_NATUPNP="no"
+        elif test "x$enableval" = "xyes"; then
+            WANT_NATUPNP="yes"
+        fi
+    ]
+)
+
 
 DEPSEARCH=
 LIBSODIUM_SEARCH_HEADERS=
@@ -276,7 +289,6 @@ else
     AC_SUBST(LIBSODIUM_LDFLAGS)
 fi
 
-
 # Checks for header files.
 AC_CHECK_HEADERS([arpa/inet.h fcntl.h netdb.h netinet/in.h stdint.h stdlib.h string.h sys/socket.h sys/time.h unistd.h])
 
@@ -336,6 +348,22 @@ else
     AC_SUBST(LIBSODIUM_CFLAGS)
 fi
 
+# Checks for typedefs, structures, and compiler characteristics.
+AC_HEADER_STDBOOL
+AC_TYPE_INT16_T
+AC_TYPE_INT32_T
+AC_TYPE_PID_T
+AC_TYPE_SIZE_T
+AC_TYPE_UINT16_T
+AC_TYPE_UINT32_T
+AC_TYPE_UINT64_T
+AC_TYPE_UINT8_T
+
+# Checks for library functions.
+AC_FUNC_FORK
+AC_CHECK_FUNCS([gettimeofday memset socket strchr malloc])
+
+
 if test "x$WANT_NATPMP" = "xyes"; then
     AC_CHECK_HEADER(natpmp.h,
         [],
@@ -357,20 +385,35 @@ if test "x$WANT_NATPMP" = "xyes"; then
     fi
 fi
 
-# Checks for typedefs, structures, and compiler characteristics.
-AC_HEADER_STDBOOL
-AC_TYPE_INT16_T
-AC_TYPE_INT32_T
-AC_TYPE_PID_T
-AC_TYPE_SIZE_T
-AC_TYPE_UINT16_T
-AC_TYPE_UINT32_T
-AC_TYPE_UINT64_T
-AC_TYPE_UINT8_T
+if test "x$WANT_NATUPNP" = "xyes"; then
+    AX_PTHREAD(
+        [],
+        [
+            AC_MSG_WARN([disabling NAT-UPnP support: required library pthread not found])
+            WANT_NATUPNP=no
+        ]
+    )
 
-# Checks for library functions.
-AC_FUNC_FORK
-AC_CHECK_FUNCS([gettimeofday memset socket strchr malloc])
+    AC_CHECK_HEADER("miniupnpc/miniupnpc.h",
+        [],
+        [
+            AC_MSG_WARN([header file for library libminiupnpc was not found on your system, disabling NAT-UPnP support])
+            WANT_NATUPNP=no
+        ]
+    )
+    AC_CHECK_LIB(miniupnpc, upnpDiscover,
+        [],
+        [
+            AC_MSG_WARN([library libminiupnpc was not found on your system, disabling NAT-UPnP support])
+            WANT_NATUPNP=no
+        ]
+    )
+
+    if test "x$WANT_NATUPNP" = "xyes"; then
+        LIBS="$LIBS -lminiupnpc -lpthread"
+    fi
+fi
+
 
 if test "x$BUILD_AV" = "xyes"; then
     AX_PTHREAD(
@@ -622,6 +665,7 @@ AM_CONDITIONAL(BUILD_NTOX, test "x$BUILD_NTOX" = "xyes")
 AM_CONDITIONAL(BUILD_AV, test "x$BUILD_AV" = "xyes")
 AM_CONDITIONAL(BUILD_TESTING, test "x$BUILD_TESTING" = "xyes")
 AM_CONDITIONAL(WANT_NATPMP, test "x$WANT_NATPMP" = "xyes")
+AM_CONDITIONAL(WANT_NATUPNP, test "x$WANT_NATUPNP" = "xyes")
 AM_CONDITIONAL(WIN32, test "x$WIN32" = "xyes")
 
 AC_CONFIG_FILES([Makefile

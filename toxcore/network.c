@@ -36,15 +36,70 @@
 #include "network.h"
 #include "util.h"
 
-#ifdef HAVE_LIBNATPMP
-#include <natpmp.h>
+
+/*
+ * port forwarding
+ */
 
 #define PORT_FORWARD_DURATION 7200
 
-static void *init_port_forwarding(uint16_t port);
-static int8_t check_port_forwarding(void **_natpmp, uint16_t port);
+typedef struct nat_t nat_t;
+
+typedef struct nat_t {
+    void    *data;
+    uint64_t port_forward_start;
+    uint64_t port_forward_until;
+
+    void *(*init_nat)(uint16_t port);
+    int8_t (*check_nat)(nat_t *nat, uint16_t port);
+} nat_t;
+
+#ifdef HAVE_LIBNATPMP
+#include <natpmp.h>
+
+static void *init_nat_pmp(uint16_t port);
+static int8_t check_nat_pmp(nat_t *nat, uint16_t port);
 
 #endif /* HAVE_LIBNATPMP */
+
+#ifdef HAVE_LIBMINIUPNPC
+
+/* MUST have pthread (or another thread lib)
+ *           to allow asynchronous discovery */
+#ifdef HAVE_PTHREAD
+
+#include <upnp/upnp.h>
+
+#include <pthread.h>
+
+#include <miniupnpc/miniwget.h>
+#include <miniupnpc/miniupnpc.h>
+#include <miniupnpc/upnpcommands.h>
+
+static void *init_nat_upnp(uint16_t port);
+static int8_t check_nat_upnp(nat_t *nat, uint16_t port);
+
+#else /* !HAVE_PHTREAD */
+
+/* no thread support (required) */
+#undef HAVE_LIBMINIUPNPC
+
+#endif /* !HAVE_PTHREAD */
+
+#endif /* HAVE_LIBMINIUPNPC */
+
+#if defined(HAVE_LIBNATPMP) || defined(HAVE_LIBMINIUPNPC)
+
+typedef struct {
+#ifdef HAVE_LIBNATPMP
+    nat_t pmp;
+#endif
+#ifdef HAVE_LIBMINIUPNPC
+    nat_t upnp;
+#endif
+} nats_t;
+
+#endif /* defined(HAVE_LIBNATPMP) || defined(HAVE_LIBMINIUPNPC) */
 
 #ifndef IPV6_V6ONLY
 #define IPV6_V6ONLY 27
@@ -285,45 +340,87 @@ void networking_registerhandler(Networking_Core *net, uint8_t byte, packet_handl
     net->packethandlers[byte].object = object;
 }
 
-#ifdef HAVE_LIBNATPMP
-static void natpmp_do(Networking_Core *net)
+#if defined(HAVE_LIBNATPMP) || defined(HAVE_LIBMINIUPNPC)
+static void nats_init(Networking_Core *net)
 {
-    if ((net->port_forward_start != 0) && (net->port_forward_start != unix_time())) {
-        /* request was sent, poll for success/failure */
-        net->port_forward_start = unix_time();
+    nats_t *nats = calloc(1, sizeof(*nats));
 
-        if (!net->natpmp) /* something went wrong... somewhere */
-            net->port_forward_start = 0;
+#ifdef HAVE_LIBNATPMP
+    nats->pmp.data = init_nat_pmp(net->port);
+#ifdef LOGGING
+
+    if (nats->pmp.data)
+        loglog("Port forwarding: Setting up NAT-PMP.\n");
+
+#endif /* LOGGING */
+    nats->pmp.init_nat = init_nat_pmp;
+    nats->pmp.check_nat = check_nat_pmp;
+#endif /* HAVE_LIBNATPMP */
+
+#ifdef HAVE_LIBMINIUPNPC
+    nats->upnp.data = init_nat_upnp(net->port);
+#ifdef LOGGING
+
+    if (nats->upnp.data)
+        loglog("Port forwarding: Setting up NAT-UPnP.\n");
+
+#endif /* LOGGING */
+    nats->upnp.init_nat = init_nat_upnp;
+    nats->upnp.check_nat = check_nat_upnp;
+#endif /* HAVE_LIBMINIUPNPC */
+
+    net->nats = nats;
+}
+
+static void nat_do(Networking_Core *net, nat_t *nat)
+{
+    if ((nat->port_forward_start != 0) && (nat->port_forward_start != unix_time())) {
+        /* request was sent, poll for success/failure */
+        nat->port_forward_start = unix_time();
+
+        if (!nat->data) /* something went wrong... somewhere */
+            nat->port_forward_start = 0;
         else {
             /* poll status */
-            int8_t res = check_port_forwarding(&net->natpmp, net->port);
+            int8_t res = nat->check_nat(nat, net->port);
 
             if (res > 0) { /* mapping has been accepted */
-                net->port_forward_start = 0;
-                net->port_forward_until = unix_time() + PORT_FORWARD_DURATION;
+                nat->port_forward_start = 0;
+                nat->port_forward_until = unix_time() + PORT_FORWARD_DURATION;
             } else if (res < 0) /* error we can't recover from */
-                net->port_forward_start = 0;
+                nat->port_forward_start = 0;
         }
-    } else if (!net->natpmp && net->port_forward_until
-               && is_timeout(net->port_forward_until, PORT_FORWARD_DURATION * 3 / 4)) {
+    } else if (nat->port_forward_until && !nat->data &&
+               is_timeout(nat->port_forward_until, PORT_FORWARD_DURATION * 3 / 4)) {
         /* we're closing in on the end of the mapping's lifetime: (try to) refresh mapping */
-        net->natpmp = init_port_forwarding(net->port);
+        nat->data = nat->init_nat(net->port);
 
-        if (net->natpmp) /* request sent, start polling again */
-            net->port_forward_start = unix_time();
+        if (nat->data) /* request sent, start polling again */
+            nat->port_forward_start = unix_time();
         else /* very unexpected failure: try again in 1/8 PFD (15m) */
-            net->port_forward_until += PORT_FORWARD_DURATION / 8;
+            nat->port_forward_until += PORT_FORWARD_DURATION / 8;
     }
 }
+
+static void nats_do(Networking_Core *net)
+{
+    nats_t *nats = net->nats;
+#ifdef HAVE_LIBNATPMP
+    nat_do(net, &nats->pmp);
 #endif /* HAVE_LIBNATPMP */
+#ifdef HAVE_LIBMINIUPNPC
+    nat_do(net, &nats->upnp);
+#endif /* HAVE_LIBMINIUPNPC */
+}
+#endif /* defined(HAVE_LIBNATPMP) || defined(HAVE_LIBMINIUPNPC) */
 
 void networking_poll(Networking_Core *net)
 {
     unix_time_update();
 
-#ifdef HAVE_LIBNATPMP
-    natpmp_do(net);
-#endif /* HAVE_LIBNATPMP */
+#if defined(HAVE_LIBNATPMP) || defined(HAVE_LIBMINIUPNPC)
+    nats_do(net);
+#endif /* defined(HAVE_LIBNATPMP) || defined(HAVE_LIBMINIUPNPC) */
 
     IP_Port ip_port;
     uint8_t data[MAX_UDP_PACKET_SIZE];
@@ -479,96 +576,6 @@ static void at_shutdown(void)
 #endif
 }
 */
-
-
-/* request UDP port forwarding for PORT_FORWARD_DURATION from outside to inside
- *  return a pointer if setup was successful and request pushed,
- *  return NULL on error. */
-void *init_port_forwarding(uint16_t port)
-{
-#ifdef HAVE_LIBNATPMP
-    natpmp_t *natpmp = calloc(1, sizeof(*natpmp));
-
-    if (!natpmp)
-        return NULL;
-
-    if (initnatpmp(natpmp, 0, 0) != 0) {
-        free(natpmp);
-        return NULL;
-    }
-
-    if (sendnewportmappingrequest(natpmp, NATPMP_PROTOCOL_UDP, port, port, PORT_FORWARD_DURATION) != 12) {
-        closenatpmp(natpmp);
-        free(natpmp);
-        return NULL;
-    }
-
-    return natpmp;
-#else /* !HAVE_LIBNATPMP */
-    return NULL;
-#endif /* !HAVE_LIBNATPMP */
-}
-
-/* tries to figure out if the request was successfully delivered
- * and accepted by a gateway device
- *
- *  returns  1 if request was successful
- *  returns  0 if status of request hasn't been decided yet
- *  returns -1 on error
- */
-int8_t check_port_forwarding(void **_natpmp, uint16_t port)
-{
-#ifdef HAVE_LIBNATPMP
-
-    if (!_natpmp || !*_natpmp)
-        return -1;
-
-    natpmp_t *natpmp = *_natpmp;
-    natpmpresp_t response;
-    int res = readnatpmpresponseorretry(natpmp, &response);
-
-    if (res == NATPMP_TRYAGAIN)
-        return 0; /* keep trying */
-    else if (res == 0) {
-        closenatpmp(natpmp);
-        free(natpmp);
-        *_natpmp = NULL;
-
-#ifdef LOGGING
-        loglog("Port forwarding: Completed successfully.\n");
-#endif /* LOGGING */
-
-        return 1;
-    } else if (res == NATPMP_ERR_NOPENDINGREQ) {
-        /* request failed: retry from the beginning */
-        closenatpmp(natpmp);
-        free(natpmp);
-        *_natpmp = init_port_forwarding(port);
-
-#ifdef LOGGING
-        loglog("Port forwarding: Request to setup didn't make it. Trying again...\n");
-#endif /* LOGGING */
-
-        return 0;
-    } else {
-        /* "unrecoverable" error */
-        closenatpmp(natpmp);
-        free(natpmp);
-        *_natpmp = NULL;
-
-#ifdef LOGGING
-        sprintf(logbuffer, "Port forwarding: Request to setup failed terminally. Last result %i.\n", res);
-        loglog(logbuffer);
-#endif /* LOGGING */
-
-        return -1;
-    }
-
-#else /* !HAVE_LIBNATPMP */
-    return 0;
-#endif /* !HAVE_LIBNATPMP */
-}
-
 
 /* Initialize networking.
  * Bind to ip and port.
@@ -767,17 +774,9 @@ Networking_Core *new_networking(IP ip, uint16_t port)
             loglog(logbuffer);
 #endif
 
-#ifdef HAVE_LIBNATPMP
-            temp->natpmp = init_port_forwarding(temp->port);
-
-            if (temp->natpmp) {
-                temp->port_forward_start = unix_time();
-#ifdef LOGGING
-                loglog("Port forwarding: Setting up.\n");
-#endif /* LOGGING */
-            }
-
-#endif /* HAVE_LIBNATPMP */
+#if defined(HAVE_LIBNATPMP) || defined(HAVE_LIBMINIUPNPC)
+            nats_init(temp);
+#endif /* defined(HAVE_LIBNATPMP) || defined(HAVE_LIBMINIUPNPC) */
 
             /* errno isn't reset on success, only set on failure, the failed
              * binds with parallel clients yield a -EPERM to the outside if
@@ -1123,6 +1122,257 @@ int addr_resolve_or_parse_ip(const char *address, IP *to, IP *extra)
 
     return 1;
 };
+
+
+#ifdef HAVE_LIBNATPMP
+/* request UDP port forwarding for PORT_FORWARD_DURATION from outside to inside
+ *  return a pointer if setup was successful and request pushed,
+ *  return NULL on error. */
+static void *init_nat_pmp(uint16_t port)
+{
+    natpmp_t *natpmp = calloc(1, sizeof(*natpmp));
+
+    if (!natpmp)
+        return NULL;
+
+    if (initnatpmp(natpmp, 0, 0) != 0) {
+        free(natpmp);
+        return NULL;
+    }
+
+    if (sendnewportmappingrequest(natpmp, NATPMP_PROTOCOL_UDP, port, port, PORT_FORWARD_DURATION) != 12) {
+        closenatpmp(natpmp);
+        free(natpmp);
+        return NULL;
+    }
+
+    return natpmp;
+}
+
+/* tries to figure out if the request was successfully delivered
+ * and accepted by a gateway device
+ *
+ *  returns  1 if request was successful
+ *  returns  0 if status of request hasn't been decided yet
+ *  returns -1 on error
+ */
+static int8_t check_nat_pmp(nat_t *nat, uint16_t port)
+{
+    if (!nat)
+        return -1;
+
+    natpmp_t *natpmp = nat->data;
+
+    if (!natpmp)
+        return -1;
+
+    natpmpresp_t response;
+    int res = readnatpmpresponseorretry(natpmp, &response);
+
+    if (res == NATPMP_TRYAGAIN)
+        return 0; /* keep trying */
+    else if (res == 0) {
+        closenatpmp(natpmp);
+        free(natpmp);
+        nat->data = NULL;
+
+#ifdef LOGGING
+        loglog("Port forwarding: Completed successfully.\n");
+#endif /* LOGGING */
+
+        return 1;
+    } else if (res == NATPMP_ERR_NOPENDINGREQ) {
+        /* request failed: retry from the beginning */
+        closenatpmp(natpmp);
+        free(natpmp);
+        nat->data = nat->init_nat(port);
+
+#ifdef LOGGING
+        loglog("Port forwarding: Request to setup didn't make it. Trying again...\n");
+#endif /* LOGGING */
+
+        return 0;
+    } else {
+        /* "unrecoverable" error */
+        closenatpmp(natpmp);
+        free(natpmp);
+        nat->data = NULL;
+
+#ifdef LOGGING
+        sprintf(logbuffer, "Port forwarding: Request to setup failed terminally. Last result %i.\n", res);
+        loglog(logbuffer);
+#endif /* LOGGING */
+
+        return -1;
+    }
+}
+#endif /* HAVE_LIBNATPMP */
+
+
+#ifdef HAVE_LIBMINIUPNPC
+typedef struct nat_upnp_t {
+    nat_t     *nat;
+    uint16_t   port;
+
+    uint8_t    thread_status;
+    uint8_t    result;
+
+    struct UPNPUrls     priv_urls;
+    struct IGDdatas     priv_data;
+} nat_upnp_t;
+
+static void *init_nat_upnp_thread(void *_nat_upnp)
+{
+    nat_upnp_t *nat_upnp = _nat_upnp;
+
+    if (!nat_upnp)
+        return NULL;
+
+    nat_upnp->thread_status = 2;
+
+    int upnperror = 0;
+    /* this is the call that's taking long enough to justify an extra thread */
+    struct UPNPDev *devlist = upnpDiscover(5000, NULL, NULL, 0, 0, &upnperror);
+
+    if (!devlist) {
+        nat_upnp->thread_status = 3;
+#ifdef LOGGING
+        sprintf(logbuffer, "Port forwarding: Failed to discover any UPnP devices (%d).\n", upnperror);
+        loglog(logbuffer);
+#endif
+        return NULL;
+    }
+
+    struct UPNPDev *dev = devlist;
+
+    while (dev) {
+        if (strstr(dev->st, "InternetGatewayDevice"))
+            break;
+
+        dev = dev->pNext;
+    }
+
+    if (!dev) {
+#ifdef LOGGING
+        loglog("Port forwarding: Found some UPnP devices, but none describes itself as IGD.\n");
+#endif
+    } else {
+#ifdef LOGGING
+        sprintf(logbuffer, "Port forwarding: UPnP device of type IGD found (%s)\n", dev->descURL);
+        loglog(logbuffer);
+#endif
+
+        int descXMLsize = 0;
+        char *descXML = miniwget(dev->descURL, &descXMLsize);
+
+        if (!descXML) {
+#ifdef LOGGING
+            loglog("Port forwarding: Failed to fetch device's interface data.\n");
+#endif
+        } else {
+            memset(&nat_upnp->priv_urls, 0, sizeof(struct UPNPUrls));
+            memset(&nat_upnp->priv_data, 0, sizeof(struct IGDdatas));
+
+            parserootdesc(descXML, descXMLsize, &nat_upnp->priv_data);
+            free(descXML);
+            descXML = NULL;
+
+            GetUPNPUrls(&nat_upnp->priv_urls, &nat_upnp->priv_data, dev->descURL);
+#ifdef LOGGING
+            loglog("Port forwarding: Retrieved device's interface data. All set for a mapping...\n");
+#endif
+            nat_upnp->result = 1;
+        }
+    }
+
+    freeUPNPDevlist(devlist);
+
+    nat_upnp->thread_status = 3;
+    return NULL;
+}
+
+static void *init_nat_upnp(uint16_t port)
+{
+    nat_t *nat = calloc(1, sizeof(*nat));
+
+    if (!nat)
+        return NULL;
+
+    nat->init_nat = init_nat_upnp;
+    nat->check_nat = check_nat_upnp;
+
+    nat_upnp_t *nat_upnp = calloc(1, sizeof(*nat_upnp));
+
+    if (!nat_upnp) {
+        free(nat);
+        return NULL;
+    }
+
+    nat_upnp->nat = nat;
+    nat_upnp->port = port;
+    nat_upnp->thread_status = 1;
+    pthread_t thread;
+
+    if (!pthread_create(&thread, NULL, init_nat_upnp_thread, nat_upnp))
+        return nat;
+    else {
+        /* failed to create thread */
+        free(nat);
+        free(nat_upnp);
+        return NULL;
+    }
+}
+
+static int8_t check_nat_upnp(nat_t *nat, uint16_t port)
+{
+    if (!nat)
+        return -1;
+
+    nat_upnp_t *nat_upnp = nat->data;
+
+    if (!nat->data)
+        return -1;
+
+    if (nat_upnp->thread_status == 3) {
+        int8_t retval = -1;
+
+        if (nat_upnp->result) {
+            /* hopefully addr ISN'T required (our packet contains the address,
+             * the receiving server SHOULD be able to infer), else there'll be
+             * a lot more ugly non-portable work to do */
+            char *addr = NULL;
+
+            char port_str[16];
+            char duration_str[16];
+            sprintf(port_str, "%d", port);
+            sprintf(duration_str, "%d", PORT_FORWARD_DURATION);
+
+            /* this SHOULDN'T take that long to warrant a parallel thread */
+            int res = UPNP_AddPortMapping(nat_upnp->priv_urls.controlURL, nat_upnp->priv_data.first.servicetype,
+                                          port_str, port_str, addr, "Tox", "UDP", NULL, duration_str);
+#ifdef LOGGING
+            sprintf(logbuffer, "Port forwarding: UPnP::AddPortMapping(%hhu) %s (result = %i)\n", port,
+                    res == 0 ? "succeeded" : "failed", res);
+            loglog(logbuffer);
+#endif
+            /* potentially retry with different parameters depending on errors,
+             * this will likely depend on feedback by users what various routers accept,
+             * e.g. on 725 OnlyPermanentLeasesSupported maybe try to call with a NULL duration */
+
+            if (!res)
+                retval = 1;
+        }
+
+        /* cleanup */
+        nat->data = NULL;
+        free(nat_upnp);
+
+        return retval;
+
+    } else
+        return 0; /* thread still running */
+}
+#endif /* HAVE_LIBMINIUPNPC */
 
 #ifdef LOGGING
 static char errmsg_ok[3] = "OK";
