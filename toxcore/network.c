@@ -1219,6 +1219,7 @@ typedef struct nat_upnp_t {
 
     struct UPNPUrls     priv_urls;
     struct IGDdatas     priv_data;
+    char                priv_LAN_addr[64];
 } nat_upnp_t;
 
 static void *init_nat_upnp_thread(void *_nat_upnp)
@@ -1235,57 +1236,42 @@ static void *init_nat_upnp_thread(void *_nat_upnp)
     struct UPNPDev *devlist = upnpDiscover(5000, NULL, NULL, 0, 0, &upnperror);
 
     if (!devlist) {
-        nat_upnp->thread_status = 3;
 #ifdef LOGGING
         sprintf(logbuffer, "Port forwarding: Failed to discover any UPnP devices (%d).\n", upnperror);
         loglog(logbuffer);
 #endif
+        nat_upnp->thread_status = 3;
         return NULL;
     }
 
-    struct UPNPDev *dev = devlist;
+    int res = UPNP_GetValidIGD(devlist, &nat_upnp->priv_urls, &nat_upnp->priv_data, nat_upnp->priv_LAN_addr,
+                               sizeof(nat_upnp->priv_LAN_addr));
 
-    while (dev) {
-        if (strstr(dev->st, "InternetGatewayDevice"))
-            break;
+    freeUPNPDevlist(devlist);
 
-        dev = dev->pNext;
-    }
-
-    if (!dev) {
+    if (res != 1) {
 #ifdef LOGGING
-        loglog("Port forwarding: Found some UPnP devices, but none describes itself as IGD.\n");
+
+        if (res == 0)
+            loglog("Port forwarding: Didn't find any valid UPnP device.\n");
+        else if (res == 2)
+            loglog("Port forwarding: An InternetGatewayDevice (UPnP:IGD) was found, but it announced to be not connected.\n");
+        else if (res == 3)
+            loglog("Port forwarding: Found some UPnP devices, but none describes itself as IGD.\n");
+        else {
+            sprintf(logbuffer, "Port forwarding: Didn't find any valid UPnP device, unknown result (%d)\n", res);
+            loglog(logbuffer);
+        }
+
 #endif
     } else {
 #ifdef LOGGING
-        sprintf(logbuffer, "Port forwarding: UPnP device of type IGD found (%s)\n", dev->descURL);
+        sprintf(logbuffer, "Port forwarding: Retrieved device (@%s)'s interface data. All set for a mapping...\n",
+                nat_upnp->priv_urls.ipcondescURL);
         loglog(logbuffer);
 #endif
-
-        int descXMLsize = 0;
-        char *descXML = miniwget(dev->descURL, &descXMLsize);
-
-        if (!descXML) {
-#ifdef LOGGING
-            loglog("Port forwarding: Failed to fetch device's interface data.\n");
-#endif
-        } else {
-            memset(&nat_upnp->priv_urls, 0, sizeof(struct UPNPUrls));
-            memset(&nat_upnp->priv_data, 0, sizeof(struct IGDdatas));
-
-            parserootdesc(descXML, descXMLsize, &nat_upnp->priv_data);
-            free(descXML);
-            descXML = NULL;
-
-            GetUPNPUrls(&nat_upnp->priv_urls, &nat_upnp->priv_data, dev->descURL);
-#ifdef LOGGING
-            loglog("Port forwarding: Retrieved device's interface data. All set for a mapping...\n");
-#endif
-            nat_upnp->result = 1;
-        }
+        nat_upnp->result = 1;
     }
-
-    freeUPNPDevlist(devlist);
 
     nat_upnp->thread_status = 3;
     return NULL;
@@ -1337,11 +1323,6 @@ static int8_t check_nat_upnp(nat_t *nat, uint16_t port)
         int8_t retval = -1;
 
         if (nat_upnp->result) {
-            /* hopefully addr ISN'T required (our packet contains the address,
-             * the receiving server SHOULD be able to infer), else there'll be
-             * a lot more ugly non-portable work to do */
-            char *addr = NULL;
-
             char port_str[16];
             char duration_str[16];
             sprintf(port_str, "%d", port);
@@ -1349,10 +1330,10 @@ static int8_t check_nat_upnp(nat_t *nat, uint16_t port)
 
             /* this SHOULDN'T take that long to warrant a parallel thread */
             int res = UPNP_AddPortMapping(nat_upnp->priv_urls.controlURL, nat_upnp->priv_data.first.servicetype,
-                                          port_str, port_str, addr, "Tox", "UDP", NULL, duration_str);
+                                          port_str, port_str, nat_upnp->priv_LAN_addr, "Tox", "UDP", NULL, duration_str);
 #ifdef LOGGING
-            sprintf(logbuffer, "Port forwarding: UPnP::AddPortMapping(%hhu) %s (result = %i)\n", port,
-                    res == 0 ? "succeeded" : "failed", res);
+            sprintf(logbuffer, "Port forwarding: UPnP::AddPortMapping(%s:%hhu) %s (result = %i)\n",
+                    nat_upnp->priv_LAN_addr, port, res == 0 ? "succeeded" : "failed", res);
             loglog(logbuffer);
 #endif
             /* potentially retry with different parameters depending on errors,
