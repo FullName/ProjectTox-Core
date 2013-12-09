@@ -368,14 +368,14 @@ if test "x$WANT_NATPMP" = "xyes"; then
     AC_CHECK_HEADER(natpmp.h,
         [],
         [
-            AC_MSG_WARN([header file for library libnatpmp was not found on your system, disabling NAT-PMP support])
+            AC_MSG_WARN([disabling NAT-PMP support: header file for library libnatpmp was not found])
             WANT_NATPMP=no
         ]
     )
     AC_CHECK_LIB(natpmp, initnatpmp,
         [],
         [
-            AC_MSG_WARN([library libnatpmp was not found on your system, disabling NAT-PMP support])
+            AC_MSG_WARN([disabling NAT-PMP support: library libnatpmp was not found])
             WANT_NATPMP=no
         ]
     )
@@ -389,7 +389,7 @@ if test "x$WANT_NATUPNP" = "xyes"; then
     AX_PTHREAD(
         [],
         [
-            AC_MSG_WARN([disabling NAT-UPnP support: required library pthread not found])
+            AC_MSG_WARN([disabling NAT-UPnP support: library pthread was not found])
             WANT_NATUPNP=no
         ]
     )
@@ -397,14 +397,14 @@ if test "x$WANT_NATUPNP" = "xyes"; then
     AC_CHECK_HEADER("miniupnpc/miniupnpc.h",
         [],
         [
-            AC_MSG_WARN([header file for library libminiupnpc was not found on your system, disabling NAT-UPnP support])
+            AC_MSG_WARN([disabling NAT-UPnP support: header file for library libminiupnpc was not found])
             WANT_NATUPNP=no
         ]
     )
     AC_CHECK_LIB(miniupnpc, upnpDiscover,
         [],
         [
-            AC_MSG_WARN([library libminiupnpc was not found on your system, disabling NAT-UPnP support])
+            AC_MSG_WARN([disabling NAT-UPnP support: library libminiupnpc was not found])
             WANT_NATUPNP=no
         ]
     )

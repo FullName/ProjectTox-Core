@@ -41,17 +41,23 @@
  * port forwarding
  */
 
-#define PORT_FORWARD_DURATION 7200
+/* mapping shall be active for this many seconds */
+#define PORT_FORWARD_DURATION 7200U
+
+/* this long is waited for completion */
+#define PORT_FORWARD_TIMEOUT 30U
 
 typedef struct nat_t nat_t;
 
 typedef struct nat_t {
     void    *data;
-    uint64_t port_forward_start;
-    uint64_t port_forward_until;
+    uint64_t init;
+    uint64_t poll;
+    uint64_t until;
 
     void *(*init_nat)(uint16_t port);
     int8_t (*check_nat)(nat_t *nat, uint16_t port);
+    void (*abort_nat)(nat_t *nat, const char *reason);
 } nat_t;
 
 #ifdef HAVE_LIBNATPMP
@@ -59,6 +65,7 @@ typedef struct nat_t {
 
 static void *init_nat_pmp(uint16_t port);
 static int8_t check_nat_pmp(nat_t *nat, uint16_t port);
+static void abort_nat_pmp(nat_t *nat, const char *reason);
 
 #endif /* HAVE_LIBNATPMP */
 
@@ -78,6 +85,7 @@ static int8_t check_nat_pmp(nat_t *nat, uint16_t port);
 
 static void *init_nat_upnp(uint16_t port);
 static int8_t check_nat_upnp(nat_t *nat, uint16_t port);
+static void abort_nat_upnp(nat_t *nat, const char *reason);
 
 #else /* !HAVE_PHTREAD */
 
@@ -346,27 +354,33 @@ static void nats_init(Networking_Core *net)
     nats_t *nats = calloc(1, sizeof(*nats));
 
 #ifdef HAVE_LIBNATPMP
-    nats->pmp.data = init_nat_pmp(net->port);
-#ifdef LOGGING
-
-    if (nats->pmp.data)
-        loglog("Port forwarding: Setting up NAT-PMP.\n");
-
-#endif /* LOGGING */
     nats->pmp.init_nat = init_nat_pmp;
     nats->pmp.check_nat = check_nat_pmp;
+    nats->pmp.abort_nat = abort_nat_pmp;
+    nats->pmp.data = init_nat_pmp(net->port);
+
+    if (nats->pmp.data) {
+        nats->pmp.init = unix_time();
+#ifdef LOGGING
+        loglog("Port forwarding (NAT-PMP): Initialized.\n");
+#endif /* LOGGING */
+    }
+
 #endif /* HAVE_LIBNATPMP */
 
 #ifdef HAVE_LIBMINIUPNPC
-    nats->upnp.data = init_nat_upnp(net->port);
-#ifdef LOGGING
-
-    if (nats->upnp.data)
-        loglog("Port forwarding: Setting up NAT-UPnP.\n");
-
-#endif /* LOGGING */
     nats->upnp.init_nat = init_nat_upnp;
     nats->upnp.check_nat = check_nat_upnp;
+    nats->upnp.abort_nat = abort_nat_upnp;
+    nats->upnp.data = init_nat_upnp(net->port);
+
+    if (nats->upnp.data) {
+        nats->upnp.init = unix_time();
+#ifdef LOGGING
+        loglog("Port forwarding (UPnP): Initialized.\n");
+#endif /* LOGGING */
+    }
+
 #endif /* HAVE_LIBMINIUPNPC */
 
     net->nats = nats;
@@ -374,31 +388,38 @@ static void nats_init(Networking_Core *net)
 
 static void nat_do(Networking_Core *net, nat_t *nat)
 {
-    if ((nat->port_forward_start != 0) && (nat->port_forward_start != unix_time())) {
+    if ((nat->init != 0) && (nat->poll != unix_time())) {
         /* request was sent, poll for success/failure */
-        nat->port_forward_start = unix_time();
+        nat->poll = unix_time();
 
-        if (!nat->data) /* something went wrong... somewhere */
-            nat->port_forward_start = 0;
-        else {
+        if (!nat->data) { /* something went wrong... somewhere */
+#ifdef LOGGING
+            loglog("Port forwarding: Unexpected state.\n");
+#endif
+            nat->init = 0;
+        } else {
             /* poll status */
             int8_t res = nat->check_nat(nat, net->port);
 
             if (res > 0) { /* mapping has been accepted */
-                nat->port_forward_start = 0;
-                nat->port_forward_until = unix_time() + PORT_FORWARD_DURATION;
-            } else if (res < 0) /* error we can't recover from */
-                nat->port_forward_start = 0;
+                nat->init = 0;
+                nat->until = unix_time() + PORT_FORWARD_DURATION;
+            } else if (res < 0) { /* error we can't recover from */
+                nat->init = 0;
+            } else if (nat->poll - nat->init > PORT_FORWARD_TIMEOUT) {
+                nat->abort_nat(nat, "timeout");
+                nat->init = 0;
+            }
         }
-    } else if (nat->port_forward_until && !nat->data &&
-               is_timeout(nat->port_forward_until, PORT_FORWARD_DURATION * 3 / 4)) {
+    } else if (nat->until && !nat->data &&
+               is_timeout(nat->until, PORT_FORWARD_DURATION * 3 / 4)) {
         /* we're closing in on the end of the mapping's lifetime: (try to) refresh mapping */
         nat->data = nat->init_nat(net->port);
 
-        if (nat->data) /* request sent, start polling again */
-            nat->port_forward_start = unix_time();
-        else /* very unexpected failure: try again in 1/8 PFD (15m) */
-            nat->port_forward_until += PORT_FORWARD_DURATION / 8;
+        if (nat->data) { /* request sent, start polling again */
+            nat->init = unix_time();
+        } else /* very unexpected failure: try again in 1/8 PFD (15m) */
+            nat->until += PORT_FORWARD_DURATION / 8;
     }
 }
 
@@ -1135,12 +1156,24 @@ static void *init_nat_pmp(uint16_t port)
     if (!natpmp)
         return NULL;
 
-    if (initnatpmp(natpmp, 0, 0) != 0) {
+    int res = initnatpmp(natpmp, 0, 0);
+
+    if (res != 0) {
+#ifdef LOGGING
+        sprintf(logbuffer, "Port forwarding (NAT-PMP): Initialization failed (res = %i)\n", res);
+        loglog(logbuffer);
+#endif /* LOGGING */
         free(natpmp);
         return NULL;
     }
 
-    if (sendnewportmappingrequest(natpmp, NATPMP_PROTOCOL_UDP, port, port, PORT_FORWARD_DURATION) != 12) {
+    res = sendnewportmappingrequest(natpmp, NATPMP_PROTOCOL_UDP, port, port, PORT_FORWARD_DURATION);
+
+    if (res != 12) {
+#ifdef LOGGING
+        sprintf(logbuffer, "Port forwarding (NAT-PMP): Request failed (res = %i)\n", res);
+        loglog(logbuffer);
+#endif /* LOGGING */
         closenatpmp(natpmp);
         free(natpmp);
         return NULL;
@@ -1169,15 +1202,15 @@ static int8_t check_nat_pmp(nat_t *nat, uint16_t port)
     natpmpresp_t response;
     int res = readnatpmpresponseorretry(natpmp, &response);
 
-    if (res == NATPMP_TRYAGAIN)
+    if (res == NATPMP_TRYAGAIN) {
         return 0; /* keep trying */
-    else if (res == 0) {
+    } else if (res == 0) {
         closenatpmp(natpmp);
         free(natpmp);
         nat->data = NULL;
 
 #ifdef LOGGING
-        loglog("Port forwarding: Completed successfully.\n");
+        loglog("Port forwarding (NAT-PMP): Completed successfully.\n");
 #endif /* LOGGING */
 
         return 1;
@@ -1188,7 +1221,7 @@ static int8_t check_nat_pmp(nat_t *nat, uint16_t port)
         nat->data = nat->init_nat(port);
 
 #ifdef LOGGING
-        loglog("Port forwarding: Request to setup didn't make it. Trying again...\n");
+        loglog("Port forwarding (NAT-PMP): Request to setup got lost? Trying again...\n");
 #endif /* LOGGING */
 
         return 0;
@@ -1199,21 +1232,38 @@ static int8_t check_nat_pmp(nat_t *nat, uint16_t port)
         nat->data = NULL;
 
 #ifdef LOGGING
-        sprintf(logbuffer, "Port forwarding: Request to setup failed terminally. Last result %i.\n", res);
+        sprintf(logbuffer, "Port forwarding (NAT-PMP): Request to setup failed terminally. Last result %i.\n", res);
         loglog(logbuffer);
 #endif /* LOGGING */
 
         return -1;
     }
 }
+
+static void abort_nat_pmp(nat_t *nat, const char *reason)
+{
+    if (!nat || !nat->data)
+        return;
+
+    natpmp_t *natpmp = nat->data;
+    closenatpmp(natpmp);
+    free(natpmp);
+    nat->data = NULL;
+
+#ifdef LOGGING
+    sprintf(logbuffer, "Port forwarding (NAT-PMP): Aborted (reason: %s).\n", reason ? reason : "<unknown>");
+    loglog(logbuffer);
+#endif /* LOGGING */
+}
+
 #endif /* HAVE_LIBNATPMP */
 
 
 #ifdef HAVE_LIBMINIUPNPC
 typedef struct nat_upnp_t {
-    nat_t     *nat;
     uint16_t   port;
 
+    pthread_t  thread;
     uint8_t    thread_status;
     uint8_t    result;
 
@@ -1233,11 +1283,11 @@ static void *init_nat_upnp_thread(void *_nat_upnp)
 
     int upnperror = 0;
     /* this is the call that's taking long enough to justify an extra thread */
-    struct UPNPDev *devlist = upnpDiscover(5000, NULL, NULL, 0, 0, &upnperror);
+    struct UPNPDev *devlist = upnpDiscover((PORT_FORWARD_TIMEOUT - 8) * 250, NULL, NULL, 0, 0, &upnperror);
 
     if (!devlist) {
 #ifdef LOGGING
-        sprintf(logbuffer, "Port forwarding: Failed to discover any UPnP devices (%d).\n", upnperror);
+        sprintf(logbuffer, "Port forwarding (UPnP): Failed to discover any UPnP devices (%d).\n", upnperror);
         loglog(logbuffer);
 #endif
         nat_upnp->thread_status = 3;
@@ -1253,20 +1303,20 @@ static void *init_nat_upnp_thread(void *_nat_upnp)
 #ifdef LOGGING
 
         if (res == 0)
-            loglog("Port forwarding: Didn't find any valid UPnP device.\n");
+            loglog("Port forwarding (UPnP): Didn't find any valid UPnP device.\n");
         else if (res == 2)
-            loglog("Port forwarding: An InternetGatewayDevice (UPnP:IGD) was found, but it announced to be not connected.\n");
+            loglog("Port forwarding (UPnP): An InternetGatewayDevice (IGD) was found, but it announced to be not connected.\n");
         else if (res == 3)
-            loglog("Port forwarding: Found some UPnP devices, but none describes itself as IGD.\n");
+            loglog("Port forwarding (UPnP): Found some UPnP devices, but none describes itself as IGD.\n");
         else {
-            sprintf(logbuffer, "Port forwarding: Didn't find any valid UPnP device, unknown result (%d)\n", res);
+            sprintf(logbuffer, "Port forwarding (UPnP): Didn't find any valid UPnP device, unknown result (%d)\n", res);
             loglog(logbuffer);
         }
 
 #endif
     } else {
 #ifdef LOGGING
-        sprintf(logbuffer, "Port forwarding: Retrieved device (@%s)'s interface data. All set for a mapping...\n",
+        sprintf(logbuffer, "Port forwarding (UPnP): Retrieved device (@%s)'s interface data. All set for a mapping...\n",
                 nat_upnp->priv_urls.ipcondescURL);
         loglog(logbuffer);
 #endif
@@ -1279,32 +1329,22 @@ static void *init_nat_upnp_thread(void *_nat_upnp)
 
 static void *init_nat_upnp(uint16_t port)
 {
-    nat_t *nat = calloc(1, sizeof(*nat));
-
-    if (!nat)
-        return NULL;
-
-    nat->init_nat = init_nat_upnp;
-    nat->check_nat = check_nat_upnp;
-
     nat_upnp_t *nat_upnp = calloc(1, sizeof(*nat_upnp));
 
-    if (!nat_upnp) {
-        free(nat);
+    if (!nat_upnp)
         return NULL;
-    }
 
-    nat_upnp->nat = nat;
     nat_upnp->port = port;
     nat_upnp->thread_status = 1;
-    pthread_t thread;
 
-    if (!pthread_create(&thread, NULL, init_nat_upnp_thread, nat_upnp))
-        return nat;
+    if (!pthread_create(&nat_upnp->thread, NULL, init_nat_upnp_thread, nat_upnp))
+        return nat_upnp;
     else {
         /* failed to create thread */
-        free(nat);
         free(nat_upnp);
+#ifdef LOGGING
+        loglog("Port forwarding (UPnP): Failed to create a thread. Aborting.\n");
+#endif
         return NULL;
     }
 }
@@ -1332,27 +1372,55 @@ static int8_t check_nat_upnp(nat_t *nat, uint16_t port)
             int res = UPNP_AddPortMapping(nat_upnp->priv_urls.controlURL, nat_upnp->priv_data.first.servicetype,
                                           port_str, port_str, nat_upnp->priv_LAN_addr, "Tox", "UDP", NULL, duration_str);
 #ifdef LOGGING
-            sprintf(logbuffer, "Port forwarding: UPnP::AddPortMapping(%s:%hhu) %s (result = %i)\n",
-                    nat_upnp->priv_LAN_addr, port, res == 0 ? "succeeded" : "failed", res);
+            sprintf(logbuffer, "Port forwarding (UPnP): %hhu => %s:%hhu %s (result = %i)\n",
+                    htons(port), nat_upnp->priv_LAN_addr, htons(port), res == 0 ? "succeeded" : "failed", res);
             loglog(logbuffer);
 #endif
             /* potentially retry with different parameters depending on errors,
-             * this will likely depend on feedback by users what various routers accept,
-             * e.g. on 725 OnlyPermanentLeasesSupported maybe try to call with a NULL duration */
+             * this will likely depend on feedback by users what various routers accept:
+             * 718 ConflictInMappingEntry? Depending on circumstances, delete?
+             * 725 OnlyPermanentLeasesSupported? try a NULL duration */
 
             if (!res)
                 retval = 1;
         }
 
         /* cleanup */
-        nat->data = NULL;
+        pthread_join(nat_upnp->thread, NULL);
         free(nat_upnp);
+        nat->data = NULL;
 
         return retval;
 
     } else
         return 0; /* thread still running */
 }
+
+static void abort_nat_upnp(nat_t *nat, const char *reason)
+{
+    if (!nat || !nat->data)
+        return;
+
+    nat_upnp_t *nat_upnp = nat->data;
+
+    if (!nat_upnp)
+        return;
+
+    if ((nat_upnp->thread_status > 0) && (nat_upnp->thread_status < 3)) {
+        /* started and not finished: kill it */
+        pthread_cancel(nat_upnp->thread);
+        pthread_join(nat_upnp->thread, NULL);
+    }
+
+    free(nat_upnp);
+    nat->data = NULL;
+
+#ifdef LOGGING
+    sprintf(logbuffer, "Port forwarding (UPnP): Aborted (reason: %s).\n", reason ? reason : "<unknown>");
+    loglog(logbuffer);
+#endif /* LOGGING */
+}
+
 #endif /* HAVE_LIBMINIUPNPC */
 
 #ifdef LOGGING
